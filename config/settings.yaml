@@ -1,0 +1,25 @@
+model:
+  name: SDEN_BLIP2
+  dim: 1024
+  device: cuda
+  text_encoder: blip2-flan-t5-xl
+
+# -----------------------------
+# DATASET CONFIGURATION
+# -----------------------------
+dataset:
+  name: flickr30k_entities
+  split: test
+  root: /root/onethingai-tmp/avatar/data
+  image_root: /root/onethingai-tmp/avatar/data/flickr30k_entities/raw/flickr30k_images
+
+# -----------------------------
+# EVALUATION SETTINGS
+# -----------------------------
+eval:
+  save_dir: results
+  cache_dir: embeddings_cache
+  top_k: [1, 5, 10]
+  metrics: [recall, hit, mrr, map, r_precision, ndcg]
+  resume: true
+  save_every_n: 10
