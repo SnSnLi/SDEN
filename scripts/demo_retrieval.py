@@ -4,34 +4,56 @@ import os
 import argparse
 from tqdm import tqdm
 from collections import defaultdict
-from sden.model import SDENWrapperModel
+from encoder.clip import CLIPWrapperModel as Model
 import torch.nn.functional as F
-from dataset import QADataset  # Avatar 原始的数据类
+from data.dataset import QADataset
+
 
 
 def cosine_sim(a, b):
-    return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+    """计算两个向量的余弦相似度
+    参数:
+        a: 第一个嵌入向量 (形状 [1, 768])
+        b: 第二个嵌入向量 (形状 [1, 768])
+    返回:
+        相似度分数 (-1到1之间):
+          1 表示完全相同
+          0 表示无关
+         -1 表示完全相反
+    """
+    # 确保输入形状匹配 [1,768] vs [1,768]
+    a = a.unsqueeze(0) if a.dim() == 1 else a
+    b = b.unsqueeze(0) if b.dim() == 1 else b
+    
+    # 计算并返回相似度
+    sim = F.cosine_similarity(a, b).mean().item()
+    print(f"计算相似度: 向量a均值={a.mean().item():.4f}, 向量b均值={b.mean().item():.4f} -> 相似度={sim:.4f}")
+    return sim
 
 
 def evaluate_flickr30k(
     dataset_root,
     image_root,
     split="test",
-    top_k_list=[1, 5, 10]
+    top_k_list=[1, 5, 20]  # 添加R@20
 ):
     # 加载数据集
     dataset = QADataset(name="flickr30k_entities", root=dataset_root)
     subset = dataset.get_subset(split)
-    model = SDENWrapperModel()
-    model.eval()
-
+    model = Model()
     results = []
 
     for idx in tqdm(subset.split_indices[split], desc=f"Evaluating {split}"):
         query, query_id, answer_ids, _ = dataset[idx.item()]
 
-        # 编码 query
-        query_vec = model.encode_text(query)
+        # 编码 query 和第一个图像
+        first_img_id = answer_ids[0] if answer_ids else dataset.indices[0]
+        image_path = os.path.join(image_root, f"{first_img_id}.jpg")
+        if not os.path.exists(image_path):
+            continue
+        embeddings = model.encode_text_and_image(query, image_path)
+        query_vec = embeddings['text_embeds']
+        print(f"Query embedding shape: {query_vec.shape}, mean: {query_vec.mean().item():.4f}")
 
         # 遍历所有 candidate 图像
         scored = []
@@ -39,8 +61,11 @@ def evaluate_flickr30k(
             image_path = os.path.join(image_root, f"{img_id}.jpg")
             if not os.path.exists(image_path):
                 continue
-            image_vec = model.encoder.encode_image(image_path)
-            sim = cosine_sim(query_vec, image_vec.mean(dim=0))
+            embeddings = model.encode_text_and_image("", image_path)
+            image_vec = embeddings['image_embeds']
+            print(f"Image {img_id} embedding shape: {image_vec.shape}, mean: {image_vec.mean().item():.4f}")
+            sim = cosine_sim(query_vec, image_vec)
+            print(f"Similarity with image {img_id}: {sim:.4f}")
             scored.append((img_id, sim))
 
         # 排序
@@ -87,4 +112,3 @@ if __name__ == "__main__":
         image_root=args.image_root,
         split=args.split
     )
-
