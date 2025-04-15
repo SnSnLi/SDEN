@@ -290,9 +290,7 @@ class MultiScaleEmergenceModule(nn.Module):
         entropy_weights = (micro_entropy_weights + meso_entropy_weights) / 2
         return final_text, final_image, global_emerged, entropy_weights, semantic_graph
 
-#####################################
-# EmergenceModel：统一返回9元组
-#####################################
+
 class EmergenceModel(nn.Module):
     def __init__(self, dim=1024, text_input_dim=768, image_input_dim=768, num_classes=None, modality_dims=None):
         super().__init__()
@@ -300,24 +298,11 @@ class EmergenceModel(nn.Module):
         modality_dims = {'text': text_input_dim, 'image': image_input_dim}
         self.projections = nn.ModuleDict({k: nn.Linear(v, dim) for k, v in modality_dims.items()})
         self.multi_scale = MultiScaleEmergenceModule(base_dim=dim)
-        self.emergence_core = EmergenceCore(dim)
+        self.dynamic_topology = DynamicTopologyCoupler(dim)  # 引入动态拓扑模块
         self.num_classes = num_classes
         if num_classes:
             self.classifier = nn.Linear(dim*4, num_classes)
         self.contrastive_temp = nn.Parameter(torch.ones(1) * 0.07)
-    
-    def contrastive_loss(self, text_feat, image_feat, entropy_weights):
-        print(f"contrastive_loss input shapes - Text: {text_feat.shape}, Image: {image_feat.shape}")
-        if text_feat.dim() > 2:
-            text_feat = text_feat.mean(dim=1)
-            image_feat = image_feat.mean(dim=1)
-        text_norm = F.normalize(text_feat, dim=-1)
-        image_norm = F.normalize(image_feat, dim=-1)
-        print(f"Normalized shapes - Text: {text_norm.shape}, Image: {image_norm.shape}")
-        logits = torch.matmul(text_norm, image_norm.transpose(-2, -1)) / self.contrastive_temp
-        labels = torch.arange(text_norm.size(0)).to(text_norm.device)
-        contrastive_loss = F.cross_entropy(logits, labels)
-        return contrastive_loss * entropy_weights.mean()
     
     def forward(self, text_feat=None, image_feat=None, labels=None):
         """
@@ -344,9 +329,26 @@ class EmergenceModel(nn.Module):
             # multi_scale 返回 5 个值
             final_text, final_image, global_emerged, entropy_weights, semantic_graph = self.multi_scale(proj_text, proj_image)
             
+            # 调用动态拓扑模块进行优化
+            topology_output = self.dynamic_topology(global_emerged)
+            optimized_global_emerged = topology_output['output']
+
             # 计算损失
-            consistency_loss = -F.cosine_similarity(final_text.mean(dim=1), final_image.mean(dim=1)).mean()
-            contrastive_loss = self.contrastive_loss(final_text, final_image, entropy_weights)
+            consistency_loss = F.cosine_similarity(final_text.mean(dim=1), final_image.mean(dim=1)).mean()
+
+            # 使用拓扑模块返回的熵权重计算对比损失
+            text_norm = F.normalize(final_text.mean(dim=1), p=2, dim=1)
+            image_norm = F.normalize(final_image.mean(dim=1), p=2, dim=1)
+            logits = torch.matmul(text_norm, image_norm.t()) / self.contrastive_temp
+            labels = torch.arange(text_norm.size(0), device=text_norm.device)
+            contrastive_loss = (F.cross_entropy(logits, labels) + 
+                              F.cross_entropy(logits.t(), labels)) / 2
+            
+            # 如果有熵权重则加权
+            if topology_output['entropy_weights'] is not None:
+                weights = topology_output['entropy_weights'].mean(dim=1)
+                contrastive_loss = contrastive_loss * weights.mean()
+            
             total_loss = consistency_loss + contrastive_loss
         
         else:
@@ -355,12 +357,16 @@ class EmergenceModel(nn.Module):
                 proj_text = self.projections['text'](text_feat)
                 proj_image = self.projections['image'](image_feat)
                 final_text, final_image, global_emerged, entropy_weights, semantic_graph = self.multi_scale(proj_text, proj_image)
+                # 调用动态拓扑模块进行优化
+                topology_output = self.dynamic_topology(global_emerged)
+                optimized_global_emerged = topology_output['output']
                 total_loss = None
             elif text_feat is not None:
                 proj_text = self.projections['text'](text_feat)
                 final_text = self.emergence_core(proj_text)
                 final_image = None
                 global_emerged = final_text
+                optimized_global_emerged = final_text  # 在单模态时，直接输出final_text
                 entropy_weights = None
                 semantic_graph = None
                 total_loss = None
@@ -369,6 +375,7 @@ class EmergenceModel(nn.Module):
                 final_image = self.emergence_core(proj_image)
                 final_text = None
                 global_emerged = final_image
+                optimized_global_emerged = final_image  # 在单模态时，直接输出final_image
                 entropy_weights = None
                 semantic_graph = None
                 total_loss = None
@@ -378,7 +385,7 @@ class EmergenceModel(nn.Module):
             if (final_text is not None) and (final_image is not None):
                 emerged_raw = torch.cat([final_text, final_image], dim=-1)
             else:
-                emerged_raw = global_emerged  # 单模态时可以直接用 global_emerged
+                emerged_raw = optimized_global_emerged  # 使用优化后的全局涌现特征
             normalized_semantic = F.normalize(semantic_graph, dim=-1)
             adjacency = torch.matmul(normalized_semantic, normalized_semantic.transpose(-2, -1))
             if entropy_weights is not None:
@@ -391,8 +398,8 @@ class EmergenceModel(nn.Module):
             entropy_ranking = None
         
         # 如果有分类器，则根据 global_emerged 计算 logits
-        if (self.num_classes and global_emerged is not None):
-            logits = self.classifier(global_emerged.mean(dim=1))
+        if (self.num_classes and optimized_global_emerged is not None):
+            logits = self.classifier(optimized_global_emerged.mean(dim=1))
         else:
             logits = None
         
@@ -400,7 +407,7 @@ class EmergenceModel(nn.Module):
         return (
             final_text,         # 1
             final_image,        # 2
-            global_emerged,     # 3
+            optimized_global_emerged,  # 3: 输出优化后的全局涌现特征
             logits,             # 4
             total_loss,         # 5
             semantic_graph,     # 6

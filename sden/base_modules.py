@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, dropout=0.1):
+    def __init__(self, dim, num_heads=8, dropout=0.1, temperature=0.05):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
         self.num_heads = num_heads
@@ -13,21 +13,33 @@ class MultiHeadAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
-        
+        self.temperature = temperature  # 温度参数
+
     def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: t.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2), qkv)
-        
+
+        # 计算原始注意力分数
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # 调整温度以增强差异性
+        scores = scores / self.temperature  # 控制温度，避免过度平滑
+
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
+
+        # 特征重要性门控
+        feat_importance = torch.sigmoid(q.mean(dim=-1, keepdim=True))  # [B, H, L, 1]
+        v = v * feat_importance  # 重要性加权
+
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
-        
+
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
         return self.proj(out), attn
+
 
 class EmergenceCore(nn.Module):
     def __init__(self, dim):
@@ -91,4 +103,4 @@ class CrossModalAttention(nn.Module):
         attention_weights = F.softmax(attention_scores, dim=-1)
         weighted_values = torch.matmul(attention_weights, image_value).transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
         output = self.final_linear(weighted_values)
-        return output + text_feat 
+        return output + text_feat

@@ -120,6 +120,7 @@ class AsymmetricFlowController(nn.Module):
             nn.Sigmoid()
         )
 
+    # 修复AsymmetricFlowController的forward方法中的维度问题
     def forward(self, text_feat, image_feat, entropy_weights=None):
         # 模态特定特征提取
         text_transformed = self.text_transform(text_feat)
@@ -132,16 +133,36 @@ class AsymmetricFlowController(nn.Module):
         image_to_text_weight = flow_weights[..., 1:2]
         
         # 非对称信息流动
-        text_flow = text_transformed * text_to_image_weight
-        image_flow = image_transformed * image_to_text_weight
+        # 确保权重维度与特征维度匹配
+        text_flow = text_transformed * text_to_image_weight.expand_as(text_transformed)
+        image_flow = image_transformed * image_to_text_weight.expand_as(image_transformed)
         
         # 层级自适应融合
         if entropy_weights is not None:
+            # 确保entropy_weights的维度与text_flow和image_flow兼容
+            if entropy_weights.dim() == 2:  # [B,N]
+                entropy_weights = entropy_weights.unsqueeze(-1)  # [B,N,1]
+            elif entropy_weights.dim() == 3 and entropy_weights.size(-1) == 1:  # [B,N,1]
+                pass  # 已经是正确形状
+            else:
+                raise ValueError(f"Unexpected entropy_weights shape: {entropy_weights.shape}")
+            
+            # 确保所有张量维度匹配
+            if entropy_weights.size(1) != text_flow.size(1):
+                min_len = min(entropy_weights.size(1), text_flow.size(1))
+                entropy_weights = entropy_weights[:, :min_len, :]
+                text_flow = text_flow[:, :min_len, :]
+                image_flow = image_flow[:, :min_len, :]
+            
+            # 直接使用扩展后的权重
+            entropy_weighted_sum = entropy_weights * (text_flow + image_flow)
+            
             level_context = torch.cat([
                 text_flow,
                 image_flow,
-                entropy_weights.unsqueeze(-1) * (text_flow + image_flow)
+                entropy_weighted_sum
             ], dim=-1)
+            
             level_importance = self.level_gate(level_context)
             text_output = text_transformed + level_importance * image_flow
             image_output = image_transformed + level_importance * text_flow
@@ -183,29 +204,57 @@ class AdaptiveFeatureFusion(nn.Module):
         
         # 将特征分成两半，分别处理文本和图像部分
         split_point = seq_len // 2
+        if seq_len % 2 != 0:
+            split_point = (seq_len + 1) // 2
         text_part = x[:, :split_point, :]
         image_part = x[:, split_point:, :]
+        
+        # 保存原始特征
+        original_text = text_part.clone()
+        original_image = image_part.clone()
+        
+        # 调整大小一致性
+        if text_part.size(1) != image_part.size(1):
+            min_len = min(text_part.size(1), image_part.size(1))
+            text_part = text_part[:, :min_len, :]
+            image_part = image_part[:, :min_len, :]
+            original_text = original_text[:, :min_len, :]
+            original_image = original_image[:, :min_len, :]
         
         # 非对称信息流动
         text_enhanced, image_enhanced = self.asymmetric_controller(
             text_part, image_part, entropy_weights
         )
         
+        # 特征保留 - 混合原始特征(保留40%)
+        text_preserved = 0.6 * text_enhanced + 0.4 * original_text
+        image_preserved = 0.6 * image_enhanced + 0.4 * original_image
+        
         # 重新组合特征
-        x = torch.cat([text_enhanced, image_enhanced], dim=1)
+        x = torch.cat([text_preserved, image_preserved], dim=1)
+        
+        # 添加随机噪声增加多样性
+        noise = torch.rand_like(x) * 0.2 - 0.1
+        x = x + noise
         
         # 拓扑感知特征
         topo_features = self.topo_transform(x)
         
         # 熵感知特征增强
         if entropy_weights is not None:
-            entropy_context = entropy_weights.unsqueeze(-1) * x
+            # 添加随机性到熵权重
+            rand_weights = entropy_weights * (1.0 + (torch.rand_like(entropy_weights) * 0.3 - 0.15))
+            entropy_context = rand_weights.unsqueeze(-1) * x
             enhanced = self.entropy_aware(torch.cat([x, entropy_context], dim=-1))
         else:
             enhanced = x
-            
+        
         # 动态门控融合
-        gate = self.fusion_gate(torch.cat([topo_features, enhanced], dim=-1))
+        gate_input = torch.cat([topo_features, enhanced], dim=-1)
+        gate = self.fusion_gate(gate_input)
+        # 添加随机扰动到门控
+        gate = torch.clamp(gate + torch.rand_like(gate) * 0.2 - 0.1, 0.1, 0.9)
+        
         output = gate * topo_features + (1 - gate) * enhanced
         
         return output
@@ -224,9 +273,12 @@ class DynamicTopologyCoupler(nn.Module):
     def forward(self, text_feat=None, image_feat=None):
         # 单模态或多模态处理
         if text_feat is not None and image_feat is not None:
-            # 多模态联合涌现
+            # 多模态联合涌现 (保留原始特征)
             text_final, image_final = self.feature_extractor(text_feat, image_feat)
-            x = torch.cat([text_final, image_final], dim=1)  # 保持模态分离
+            x = torch.cat([
+                text_final + 0.5 * text_feat.mean(dim=1, keepdim=True),  # 保留30%原始特征
+                image_final + 0.5 * image_feat.mean(dim=1, keepdim=True)
+            ], dim=1)
             modality_type = 'multimodal'
         elif text_feat is not None:
             # 单模态（文本）

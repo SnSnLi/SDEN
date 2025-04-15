@@ -37,14 +37,26 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
         self.contrastive_temp = nn.Parameter(torch.ones(1) * 0.07)
         self.is_training = True
 
-    def contrastive_loss(self, text_feat, image_feat, entropy_weights):
-        # 假设输入已经为 [B, D]
-        text_norm = F.normalize(text_feat, dim=-1)
-        image_norm = F.normalize(image_feat, dim=-1)
-        logits = torch.matmul(text_norm, image_norm.transpose(-2, -1)) / self.contrastive_temp
-        labels = torch.arange(text_norm.size(0)).to(text_norm.device)
+    def contrastive_loss(text_feats, image_feats, temperature=0.07):
+        """
+        计算对比损失
+        """
+        batch_size = text_feats.shape[0]
+        
+        # 归一化特征向量
+        text_feats = F.normalize(text_feats, dim=-1)
+        image_feats = F.normalize(image_feats, dim=-1)
+        
+        # 计算相似度矩阵
+        logits = torch.matmul(text_feats, image_feats.transpose(-2, -1)) / temperature
+        
+        # 对角线上的元素应该有最高的相似度
+        labels = torch.arange(batch_size, device=logits.device)
+        
+        # 计算损失
         loss = F.cross_entropy(logits, labels)
-        return loss * entropy_weights.mean()
+        
+        return loss, logits, text_feats, image_feats
 
     def emergence_forward(self, text_features, image_features):
         # 双向涌现，得到各模态融合后的特征
